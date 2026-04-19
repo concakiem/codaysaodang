@@ -1,14 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { google } from "googleapis";
 
-// ─── Cấu hình Google Sheets ───────────────────────────────────────────────────
-// Điền vào .env.local:
-//   GOOGLE_SERVICE_ACCOUNT_EMAIL=...
-//   GOOGLE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-//   GOOGLE_SHEET_ID=...  (lấy từ URL: spreadsheets/d/[ID]/edit)
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Dùng tên không có dấu để tránh lỗi encoding với Google Sheets API
 const SHEET_NAME = "Orders";
 
 const HEADERS = [
@@ -23,30 +15,78 @@ const HEADERS = [
   "Thoi gian dat",
 ];
 
-function getGoogleAuth() {
-  const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-  const key = (process.env.GOOGLE_PRIVATE_KEY ?? "").replace(/\\n/g, "\n");
+/**
+ * Vercel lưu env vars dưới dạng string thuần — dấu xuống dòng thật trong
+ * private key bị encode thành literal "\n" (2 ký tự) hoặc "\\n" (escaped).
+ * Hàm này chuẩn hóa về dạng PEM hợp lệ bất kể Vercel encode kiểu nào.
+ */
+function parsePrivateKey(raw: string): string {
+  // Bước 1: bỏ dấu nháy đôi bao ngoài nếu có (một số người paste nguyên cả "...")
+  let key = raw.trim().replace(/^["']|["']$/g, "");
 
-  if (!email || !key) {
+  // Bước 2: chuyển literal \n (2 ký tự: backslash + n) → newline thật
+  // Phải dùng global replace vì có thể xuất hiện nhiều lần
+  key = key.replace(/\\n/g, "\n");
+
+  // Bước 3: nếu Vercel encode thêm một lần nữa (\\\\n → \\n → \n)
+  // replace lại cho chắc
+  if (key.includes("\\n")) {
+    key = key.replace(/\\n/g, "\n");
+  }
+
+  // Bước 4: đảm bảo header/footer PEM đứng trên dòng riêng
+  key = key
+    .replace(/-----BEGIN PRIVATE KEY-----\s*/g, "-----BEGIN PRIVATE KEY-----\n")
+    .replace(/\s*-----END PRIVATE KEY-----/g, "\n-----END PRIVATE KEY-----");
+
+  // Bước 5: loại bỏ khoảng trắng thừa ở đầu/cuối mỗi dòng base64
+  key = key
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .join("\n");
+
+  // Bước 6: thêm newline cuối cùng (Node crypto yêu cầu)
+  if (!key.endsWith("\n")) key += "\n";
+
+  return key;
+}
+
+function getGoogleAuth() {
+  const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL?.trim();
+  const rawKey = process.env.GOOGLE_PRIVATE_KEY ?? "";
+
+  if (!email) {
+    throw new Error("Thieu GOOGLE_SERVICE_ACCOUNT_EMAIL");
+  }
+  if (!rawKey) {
+    throw new Error("Thieu GOOGLE_PRIVATE_KEY");
+  }
+
+  const privateKey = parsePrivateKey(rawKey);
+
+  // Kiểm tra nhanh định dạng PEM
+  if (
+    !privateKey.includes("-----BEGIN PRIVATE KEY-----") ||
+    !privateKey.includes("-----END PRIVATE KEY-----")
+  ) {
     throw new Error(
-      "Thieu bien moi truong GOOGLE_SERVICE_ACCOUNT_EMAIL hoac GOOGLE_PRIVATE_KEY"
+      "GOOGLE_PRIVATE_KEY sai dinh dang — phai co BEGIN/END PRIVATE KEY"
     );
   }
 
   return new google.auth.GoogleAuth({
-    credentials: { client_email: email, private_key: key },
+    credentials: { client_email: email, private_key: privateKey },
     scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
 }
 
-// Tự động tạo sheet tab nếu chưa tồn tại
 async function ensureSheetExists(
   sheets: ReturnType<typeof google.sheets>,
   spreadsheetId: string
 ) {
   const meta = await sheets.spreadsheets.get({ spreadsheetId });
   const existing = meta.data.sheets?.map((s) => s.properties?.title) ?? [];
-
   if (!existing.includes(SHEET_NAME)) {
     await sheets.spreadsheets.batchUpdate({
       spreadsheetId,
@@ -57,7 +97,6 @@ async function ensureSheetExists(
   }
 }
 
-// Ghi header nếu sheet còn trống
 async function ensureHeader(
   sheets: ReturnType<typeof google.sheets>,
   spreadsheetId: string
@@ -66,7 +105,6 @@ async function ensureHeader(
     spreadsheetId,
     range: `${SHEET_NAME}!A1`,
   });
-
   const hasHeader = res.data.values?.[0]?.[0] === "STT";
   if (!hasHeader) {
     await sheets.spreadsheets.values.update({
@@ -78,7 +116,6 @@ async function ensureHeader(
   }
 }
 
-// Đếm số dòng để lấy STT tiếp theo
 async function getNextSTT(
   sheets: ReturnType<typeof google.sheets>,
   spreadsheetId: string
@@ -88,7 +125,7 @@ async function getNextSTT(
     range: `${SHEET_NAME}!A:A`,
   });
   const rowCount = res.data.values?.length ?? 1;
-  return rowCount; // header = row 1, đơn đầu = STT 1 (rowCount=1 sau header)
+  return rowCount;
 }
 
 export async function POST(req: NextRequest) {
@@ -103,12 +140,18 @@ export async function POST(req: NextRequest) {
     };
 
     if (!name?.trim() || !phone?.trim() || !address?.trim()) {
-      return NextResponse.json({ error: "Thieu thong tin bat buoc" }, { status: 400 });
+      return NextResponse.json(
+        { error: "Thieu thong tin bat buoc" },
+        { status: 400 }
+      );
     }
 
-    const spreadsheetId = process.env.GOOGLE_SHEET_ID;
+    const spreadsheetId = process.env.GOOGLE_SHEET_ID?.trim();
     if (!spreadsheetId) {
-      return NextResponse.json({ error: "Chua cau hinh GOOGLE_SHEET_ID" }, { status: 500 });
+      return NextResponse.json(
+        { error: "Chua cau hinh GOOGLE_SHEET_ID" },
+        { status: 500 }
+      );
     }
 
     const auth = getGoogleAuth();
@@ -118,9 +161,11 @@ export async function POST(req: NextRequest) {
     await ensureHeader(sheets, spreadsheetId);
 
     const qty = Math.max(1, Number(quantity) || 1);
-    const total = qty * 55000;
+    const total = qty * 35000;
     const stt = await getNextSTT(sheets, spreadsheetId);
-    const now = new Date().toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" });
+    const now = new Date().toLocaleString("vi-VN", {
+      timeZone: "Asia/Ho_Chi_Minh",
+    });
 
     await sheets.spreadsheets.values.append({
       spreadsheetId,
@@ -128,14 +173,27 @@ export async function POST(req: NextRequest) {
       valueInputOption: "USER_ENTERED",
       insertDataOption: "INSERT_ROWS",
       requestBody: {
-        values: [[stt, name.trim(), phone.trim(), address.trim(), qty, total, note?.trim() || "", "Cho xac nhan", now]],
+        values: [
+          [
+            stt,
+            name.trim(),
+            phone.trim(),
+            address.trim(),
+            qty,
+            total,
+            note?.trim() || "",
+            "Cho xac nhan",
+            now,
+          ],
+        ],
       },
     });
 
     return NextResponse.json({ success: true, orderId: stt });
   } catch (err) {
     console.error("[orders/POST]", err);
-    const message = err instanceof Error ? err.message : "Loi khong xac dinh";
+    const message =
+      err instanceof Error ? err.message : "Loi khong xac dinh";
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
