@@ -161,7 +161,7 @@ export async function POST(req: NextRequest) {
     await ensureHeader(sheets, spreadsheetId);
 
     const qty = Math.max(1, Number(quantity) || 1);
-    const total = qty * 35000;
+    const total = qty * 55000;
     const stt = await getNextSTT(sheets, spreadsheetId);
     const now = new Date().toLocaleString("vi-VN", {
       timeZone: "Asia/Ho_Chi_Minh",
